@@ -19,8 +19,11 @@ package docker
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,6 +83,17 @@ func planCreation(cfg *config.Cluster, networkName string) (createContainerFuncs
 		})
 	}
 
+	subnetAddress, subnetMask, err := getIpv4Subnet(networkName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed to obtain subnet of network %q", networkName)
+	}
+	allocatedIpv4Addresses, err := getAllocatedIpv4Addresses(networkName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed to obtain allocated IPv4 addresses in network %q", networkName)
+	}
+
+	var lastFoundIp = subnetAddress
+
 	// plan normal nodes
 	for i, node := range cfg.Nodes {
 		node := node.DeepCopy() // copy so we can modify
@@ -97,6 +111,12 @@ func planCreation(cfg *config.Cluster, networkName string) (createContainerFuncs
 			}
 		}
 
+		var foundIp, err = findFirstUnallocatedIpv4(lastFoundIp, subnetMask, allocatedIpv4Addresses)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed to find free Ipv4 address in network %q for node %q", networkName, name)
+		}
+		lastFoundIp = foundIp
+
 		// plan actual creation based on role
 		switch node.Role {
 		case config.ControlPlaneRole:
@@ -108,7 +128,7 @@ func planCreation(cfg *config.Cluster, networkName string) (createContainerFuncs
 						ContainerPort: common.APIServerInternalPort,
 					},
 				)
-				args, err := runArgsForNode(node, cfg.Networking.IPFamily, name, genericArgs)
+				args, err := runArgsForNode(node, cfg.Networking.IPFamily, name, foundIp, genericArgs)
 				if err != nil {
 					return err
 				}
@@ -116,7 +136,7 @@ func planCreation(cfg *config.Cluster, networkName string) (createContainerFuncs
 			})
 		case config.WorkerRole:
 			createContainerFuncs = append(createContainerFuncs, func() error {
-				args, err := runArgsForNode(node, cfg.Networking.IPFamily, name, genericArgs)
+				args, err := runArgsForNode(node, cfg.Networking.IPFamily, name, foundIp, genericArgs)
 				if err != nil {
 					return err
 				}
@@ -202,7 +222,7 @@ func commonArgs(cluster string, cfg *config.Cluster, networkName string, nodeNam
 	return args, nil
 }
 
-func runArgsForNode(node *config.Node, clusterIPFamily config.ClusterIPFamily, name string, args []string) ([]string, error) {
+func runArgsForNode(node *config.Node, clusterIPFamily config.ClusterIPFamily, name string, nodeIp string, args []string) ([]string, error) {
 	args = append([]string{
 		"--hostname", name, // make hostname match container name
 		// label the node with the role ID
@@ -228,6 +248,7 @@ func runArgsForNode(node *config.Node, clusterIPFamily config.ClusterIPFamily, n
 		"--volume", "/lib/modules:/lib/modules:ro",
 		// propagate KIND_EXPERIMENTAL_CONTAINERD_SNAPSHOTTER to the entrypoint script
 		"-e", "KIND_EXPERIMENTAL_CONTAINERD_SNAPSHOTTER",
+		"--ip", nodeIp,
 	},
 		args...,
 	)
@@ -405,4 +426,90 @@ func createContainerWithWaitUntilSystemdReachesMultiUserSystem(name string, args
 	logCmd := exec.CommandContext(logCtx, "docker", "logs", "-f", name)
 	defer logCancel()
 	return common.WaitUntilLogRegexpMatches(logCtx, logCmd, common.NodeReachedCgroupsReadyRegexp())
+}
+
+func findFirstUnallocatedIpv4(lastFoundIp string, netMaskBits int, allocatedAddresses map[string]struct{}) (string, error) {
+	ip, err := ipv4ToInt(lastFoundIp)
+	if err != nil {
+		return "", errors.Wrapf(err, "Failed to parse last found IP")
+	}
+
+	netMask := int(math.Pow(2, float64(netMaskBits))) - 1
+	begin := (ip & netMask) + 1
+	currentNet := ip & (^netMask)
+	for i := begin; i < netMask; i++ {
+		currentD := i & 0xFF
+		if currentD == 0 || currentD == 1 || currentD == 254 || currentD == 255 {
+			continue
+		}
+		currentIp := currentNet + i
+		currentIpText := intToIpv4(currentIp)
+
+		_, allocated := allocatedAddresses[currentIpText]
+		if !allocated {
+			return currentIpText, nil
+		}
+	}
+
+	return "", errors.Errorf("Could not find any available IPv4 address")
+}
+
+func intToIpv4(ip int) string {
+	ipText := strconv.Itoa((ip & 0xFF000000) >> 24)
+	ipText = ipText + "." + strconv.Itoa((ip&0x00FF0000)>>16)
+	ipText = ipText + "." + strconv.Itoa((ip&0x0000FF00)>>8)
+	ipText = ipText + "." + strconv.Itoa(ip&0x000000FF)
+	return ipText
+}
+
+func ipv4ToInt(ipv4 string) (int, error) {
+	ipElements := strings.Split(ipv4, ".")
+	var ip = 0
+	var shift = 24
+	for _, ipElement := range ipElements {
+		ipIntElement, err := strconv.Atoi(ipElement)
+		if err != nil {
+			return 0, errors.Wrapf(err, "Failed to parse IPv4 address %q", ipv4)
+		}
+		ip = ip + (ipIntElement << shift)
+		shift = shift - 8
+	}
+	return ip, nil
+}
+
+func getAllocatedIpv4Addresses(networkName string) (map[string]struct{}, error) {
+	format := `{{range (index (index . "Containers"))}} {{index . "IPv4Address"}} {{end}}`
+	cmd := exec.Command("docker", "network", "inspect", "-f", format, networkName)
+	lines, err := exec.OutputLines(cmd)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get subnets")
+	}
+	output := strings.Split(strings.TrimSpace(lines[0]), " ")
+	var result = map[string]struct{}{}
+	for _, ip := range output {
+		if ip == "" {
+			continue
+		}
+		result[strings.Split(ip, "/")[0]] = struct{}{}
+	}
+	return result, nil
+}
+
+func getIpv4Subnet(networkName string) (string, int, error) {
+	subnets, err := getSubnets(networkName)
+	if err != nil {
+		return "", 0, errors.Wrap(err, "failed to get subnets")
+	}
+	for _, subnet := range subnets {
+		matches, _ := regexp.MatchString("[0-9.]+/[0-9]+", subnet)
+		if matches {
+			split := strings.Split(subnet, "/")
+			mask, err := strconv.Atoi(split[1])
+			if err != nil {
+				return "", 0, errors.Wrapf(err, "Failed to convert %q to int", split[1])
+			}
+			return split[0], mask, nil
+		}
+	}
+	return "", 0, errors.Errorf("Could not get IPv4 subnet for network %q", networkName)
 }
